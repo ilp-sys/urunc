@@ -31,7 +31,7 @@ require (
 	github.com/vishvananda/netns v0.0.5
 	golang.org/x/sys v0.43.0
 	google.golang.org/grpc v1.79.3
-	k8s.io/cri-api v0.35.3
+	k8s.io/cri-api v0.35.4
 )
 
 require (
