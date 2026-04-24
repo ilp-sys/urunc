@@ -19,6 +19,8 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
+	"github.com/containerd/platforms"
+	"github.com/containerd/containerd/images"
 	imageSpec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimeSpec "github.com/opencontainers/runtime-spec/specs-go"
 
@@ -38,52 +40,52 @@ func (s *uruncTaskService) RegisterTTRPC(server *ttrpc.Server) error {
 }
 
 func (s *uruncTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*taskAPI.CreateTaskResponse, error) {
-	ttrpcAddr := os.Getenv("TTRPC_ADDRESS")
+	conn, err := getConnection(ctx)
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("urunc(shim): failed to get contaienrd connection")
+		return nil, err
+	}
+	defer conn.Close()
+	log.G(ctx).Info("urunc(shim): successfully connected to containerd")
 
-	if ttrpcAddr == "" {
-		log.G(ctx).Warn("TTRPC_ADDRESS not set, skipping annot patch")
-	} else {
-		conn, err := getGRPCConnection(ctx, ttrpcAddr)
-		if err != nil {
-			log.G(ctx).WithError(err).Warn("failed to fetch manifest annotations")
-			return nil, err
-		}
-		defer conn.Close()
+	ns, ok := namespaces.Namespace(ctx)
+	if !ok {
+		ns = namespaces.Default
+	}
+	ctx = namespaces.WithNamespace(ctx, ns)
 
-		ns, ok := namespaces.Namespace(ctx)
-		if !ok {
-			ns = namespaces.Default
-		}
-		ctx = namespaces.WithNamespace(ctx, ns)
+	imageEntrypoint, err := getImageEntrypoint(ctx, conn, r.ID)
+	if err != nil {
+		return nil, err
+	}
 
-		imageEntrypoint, err := getImageEntrypoint(ctx, conn, r.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		uruncAnnotations, err := fetchUruncAnnotations(ctx, conn, imageEntrypoint)
-		if err != nil {
-			return nil, fmt.Errorf("fetch urunc annotations: %w", err)
-		}
-		if len(uruncAnnotations) > 0 {
-			if err := patchConfigJSON(ctx, r.Bundle, uruncAnnotations); err != nil {
-				log.G(ctx).WithError(err).Warn("failed to patch Config.json")
-			}
+	uruncAnnotations, err := fetchUruncAnnotations(ctx, conn, imageEntrypoint)
+	if err != nil {
+		return nil, fmt.Errorf("fetch urunc annotations: %w", err)
+	}
+	if len(uruncAnnotations) > 0 {
+		if err := patchConfigJSON(ctx, r.Bundle, uruncAnnotations); err != nil {
+			log.G(ctx).WithError(err).Warn("failed to patch Config.json")
 		}
 	}
 
 	return s.TaskService.Create(ctx, r)
 }
 
-func getGRPCConnection(ctx context.Context, ttrpcAddr string) (*grpc.ClientConn, error) {
-	grpcAddr := grpcAddressFromTTRPC(ttrpcAddr)
-
+func getConnection(ctx context.Context) (*grpc.ClientConn, error) {
+	addr := os.Getenv("CONTAINERD_ADDRESS")
+	if addr == "" {
+		addr =  os.Getenv("ADDRESS")
+	}
+	if addr == "" {
+		addr = "/run/containerd/containerd.sock"
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	conn, err := grpc.DialContext(
 		dialCtx,
-		"unix://"+grpcAddr,
+		"unix://"+addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(ctx context.Context, target string) (net.Conn, error) {
 			path := strings.TrimPrefix(target, "unix://")
@@ -92,20 +94,10 @@ func getGRPCConnection(ctx context.Context, ttrpcAddr string) (*grpc.ClientConn,
 		}),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("grpc dial %s: %w", grpcAddr, err)
+		return nil, fmt.Errorf("grpc dial %s: %w", addr, err)
 	}
 
 	return conn, nil
-}
-
-func grpcAddressFromTTRPC(ttrpcAddr string) string {
-	// usually:
-	//   /run/containerd/containerd.sock.ttrpc -> /run/containerd/containerd.sock
-	if strings.HasSuffix(ttrpcAddr, ".ttrpc") {
-		return strings.TrimSuffix(ttrpcAddr, ".ttrpc")
-	}
-	// fallback
-	return "/run/containerd/containerd.sock"
 }
 
 func getImageEntrypoint(ctx context.Context, conn *grpc.ClientConn, containerID string) (*types.Descriptor, error) {
@@ -117,7 +109,7 @@ func getImageEntrypoint(ctx context.Context, conn *grpc.ClientConn, containerID 
 
 	imageRef := containersResp.Container.Image
 	if imageRef == "" {
-		return nil, err
+		return nil, fmt.Errorf("container %s has empty image ref", containerID)
 	}
 
 	imageClient := imagesAPI.NewImagesClient(conn)
@@ -136,9 +128,13 @@ func fetchUruncAnnotations(
 ) (map[string]string, error) {
 	contentClient := contentAPI.NewContentClient(conn)
 
+	manifestDesc, err := resolveManifestDescriptor(ctx, contentClient, imageEntrypoint)
+	if err != nil {
+		return nil, err
+	}
+
 	// search Manifest Annotations
-	// TODO: check if imageEntrypoint.MediaType is manifest or index, and handle index case
-	manifestRaw, err := readBlob(ctx, contentClient, imageEntrypoint.Digest, imageEntrypoint.Size)
+	manifestRaw, err := readBlob(ctx, contentClient, manifestDesc.Digest, imageEntrypoint.Size)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest blob: %w", err)
 	}
@@ -158,19 +154,67 @@ func fetchUruncAnnotations(
 	}
 
 	// filter urunc annotations only
+	// manifest annotations has higher precedence over config labels
 	filtered := make(map[string]string)
-	for k, v := range manifest.Annotations {
+	for k, v := range imageCfg.Config.Labels {
 		if strings.HasPrefix(k, uruncPrefix) {
 			filtered[k] = v
 		}
 	}
-	for k, v := range imageCfg.Config.Labels {
+	for k, v := range manifest.Annotations {
 		if strings.HasPrefix(k, uruncPrefix) {
 			filtered[k] = v
 		}
 	}
 
 	return filtered, nil
+}
+
+func resolveManifestDescriptor(
+	ctx context.Context,
+	contentClient contentAPI.ContentClient,
+	desc *types.Descriptor,
+) (*types.Descriptor, error) {
+	// single-arch image: target already points to a manifest
+	if images.IsManifestType(desc.MediaType) {
+		return desc, nil
+	}
+
+	// multi-arch image: target points to an index / manifest list
+	if images.IsIndexType(desc.MediaType) {
+		indexRaw, err := readBlob(ctx, contentClient, desc.Digest, desc.Size)
+		if err != nil {
+			return nil, fmt.Errorf("read image index blob: %w", err)
+		}
+
+		var index imageSpec.Index
+		if err := json.Unmarshal(indexRaw, &index); err != nil {
+			return nil, fmt.Errorf("unmarshal image index: %w", err)
+		}
+
+		matcher := platforms.DefaultStrict()
+
+		for _, m := range index.Manifests {
+			if m.Platform == nil {
+				continue
+			}
+
+			if matcher.Match(*m.Platform) {
+				return &types.Descriptor{
+					MediaType: m.MediaType,
+					Digest:    m.Digest.String(),
+					Size:      m.Size,
+				}, nil
+			}
+		}
+
+		return nil, fmt.Errorf(
+			"no matching manifest found in image index for platform %s",
+			platforms.Format(platforms.DefaultSpec()),
+		)
+	}
+
+	return nil, fmt.Errorf("unsupported image target media type: %s", desc.MediaType)
 }
 
 func patchConfigJSON(
@@ -211,7 +255,7 @@ func patchConfigJSON(
 	if err != nil {
 		return fmt.Errorf("marshal spec: %w", err)
 	}
-	log.G(ctx).Infof("urunc: patched config.json bytes=%d", len(patched))
+	log.G(ctx).Infof("urunc(shim): patched config.json bytes=%d", len(patched))
 
 	if err := os.WriteFile(configPath, patched, mode); err != nil {
 		return fmt.Errorf("write config.json: %w", err)
