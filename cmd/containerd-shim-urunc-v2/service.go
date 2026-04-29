@@ -16,11 +16,11 @@ import (
 	contentAPI "github.com/containerd/containerd/api/services/content/v1"
 	imagesAPI "github.com/containerd/containerd/api/services/images/v1"
 	types "github.com/containerd/containerd/api/types"
+	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/log"
-	"github.com/containerd/ttrpc"
 	"github.com/containerd/platforms"
-	"github.com/containerd/containerd/images"
+	"github.com/containerd/ttrpc"
 	imageSpec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimeSpec "github.com/opencontainers/runtime-spec/specs-go"
 
@@ -75,7 +75,7 @@ func (s *uruncTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 func getConnection(ctx context.Context) (*grpc.ClientConn, error) {
 	addr := os.Getenv("CONTAINERD_ADDRESS")
 	if addr == "" {
-		addr =  os.Getenv("ADDRESS")
+		addr = os.Getenv("ADDRESS")
 	}
 	if addr == "" {
 		addr = "/run/containerd/containerd.sock"
@@ -134,7 +134,7 @@ func fetchUruncAnnotations(
 	}
 
 	// search Manifest Annotations
-	manifestRaw, err := readBlob(ctx, contentClient, manifestDesc.Digest, imageEntrypoint.Size)
+	manifestRaw, err := readBlob(ctx, contentClient, manifestDesc.Digest, manifestDesc.Size)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest blob: %w", err)
 	}
