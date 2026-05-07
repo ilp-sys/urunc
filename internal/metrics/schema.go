@@ -43,6 +43,12 @@ const (
 	TS16
 	TS17
 	TS18
+	TS19
+	TS20
+	TS21
+	TS22
+	TS23
+	TS24
 	TimestampCount
 )
 
@@ -51,6 +57,7 @@ const (
 //   CR.* = create phase
 //   ST.* = start phase
 //   RX.* = reexec phase
+//   SH.* = shim phase
 // LegacyID (TSxx) is preserved for backward compatibility with existing tooling.
 // The Order field determines the execution sequence and must remain stable.
 
@@ -74,4 +81,10 @@ var Timestamps = []TimestampMeta{
 	{TS16, "TS16", "RX.network_setup_completed", 16},
 	{TS17, "TS17", "RX.disk_setup_completed", 17},
 	{TS18, "TS18", "RX.execve_hypervisor", 18},
+	{TS19, "TS19", "SH.create_invoked", 19},
+	{TS20, "TS20", "SH.containerd_metadata_fetch_start", 20},
+	{TS21, "TS21", "SH.containerd_metadata_fetch_done", 21},
+	{TS22, "TS22", "SH.config_patch_done", 22},
+	{TS23, "TS23", "SH.docker_metadata_fetch_start", 23},
+	{TS24, "TS24", "SH.docker_metadata_fetch_done", 24},
 }
